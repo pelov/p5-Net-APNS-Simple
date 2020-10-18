@@ -2,6 +2,18 @@ Revision history for Perl extension Net-APNS-Simple
 
 {{$NEXT}}
 
+0.06 2020-10-19T02:49:56Z
+    - Open and close the connection to the apns server in the constructor and destructor and not in
+      notify(). This will help to see early errors during connection. Also, the connection can be
+      reused for sending multiple notifications which are not known in advance.
+    - Use IO::Async to wait for responses from connect and notify.
+    - Group together the write of all HTTP/2 frames so that they can be send in a single TLS record.
+    - Don't queue all notifications and use a single notify() call. Instead prepare() returns an object
+      which is then send by notify() which also returns directly the response headers and body.
+      Eventually, prepare could be dropped.
+    - Send any pending HTTP/2 frames in connection close.
+
+
 0.05 2020-10-17T02:49:56Z
     - Add some modules to test requirements.
 

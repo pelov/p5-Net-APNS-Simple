@@ -6,10 +6,13 @@ use Carp ();
 use JSON;
 use Moo;
 use Protocol::HTTP2::Client;
-use IO::Select;
+use Protocol::HTTP2::Constants qw(const_name :frame_types :settings);
 use IO::Socket::SSL qw();
+use IO::Async::Loop;
+use IO::Async::Stream;
+use IO::Async::Timer::Countdown;
 
-our $VERSION = "0.05";
+our $VERSION = "0.06";
 
 has [qw/auth_key key_id team_id bundle_id development/] => (
     is => 'rw',
@@ -24,8 +27,9 @@ has [qw/proxy/] => (
     default => $ENV{https_proxy},
 );
 
-has [qw/apns_id apns_expiration apns_collapse_id/] => (
+has [qw/timeout/] => (
     is => 'rw',
+    default => 10,
 );
 
 has apns_priority => (
@@ -41,6 +45,13 @@ sub _host {
 }
 
 sub _port {443}
+
+sub BUILD {
+    my ($self, $args) = @_;
+
+    $self->connect();
+}
+
 
 sub _socket {
     my ($self) = @_;
@@ -62,7 +73,7 @@ sub _socket {
         if ( my $proxy = $self->proxy ) {
             $proxy =~ s|^http://|| or die "Invalid proxy $proxy - only http proxy is supported!\n";
             require Net::HTTP;
-            $socket = Net::HTTP->new(PeerAddr => $proxy) || die $@;
+            $socket = Net::HTTP->new(PeerAddr => $proxy) || die "error connecting to $proxy: $@\n";
             $socket->write_request(
                 CONNECT => "$host:$port",
                 Host => "$host:$port",
@@ -70,14 +81,14 @@ sub _socket {
                 'Proxy-Connection' => "Keep-Alive",
             );
             my ($code, $mess, %h) = $socket->read_response_headers;
-            $code eq '200' or die "Proxy error: $code $mess";
+            $code eq '200' or die "proxy error: $code $mess\n";
 
             IO::Socket::SSL->start_SSL(
                 $socket,
                 # explicitly set hostname we should use for SNI
                 SSL_hostname => $host,
                 %ssl_opts,
-            ) or die $! || $IO::Socket::SSL::SSL_ERROR;
+            ) or die "$host start_SSL error: $IO::Socket::SSL::SSL_ERROR\n";
         }
         else {
             # TLS transport socket
@@ -101,14 +112,112 @@ sub _client {
     return $self->{_client};
 }
 
+sub write_frames {
+    my $socket = shift;
+    my $client = shift;
+
+    my $buf;
+    while ( my $frame = $client->next_frame ) {
+        $buf .= $frame;
+    }
+
+    my $len = length $buf;
+    my $n = 0;
+    while ($len - $n) {
+        my $i = syswrite $socket, $buf, $len - $n, $n;
+        if ( defined $i ) {
+            $n += $i;
+        }
+        #elsif ($!{EINTR}) {
+        #    redo;
+        #}
+        else {
+            #return $n ? $n : undef;
+            return;
+        }
+    }
+    return $n;
+}
+
+sub connect {
+    my ($self) = @_;
+
+    my $host = $self->_host;
+    my $socket = $self->_socket;
+    my $client = $self->_client;
+
+    # Send HTTP/2 client preface
+    my $con = $client->{con};
+    if ( !$con->preface ) {
+        $con->enqueue_raw( $con->preface_encode );
+        $con->enqueue( SETTINGS, 0, 0, $self->{settings} );
+        $con->preface(1);
+    }
+
+    write_frames($socket, $client) or die "$!\n";
+
+    my $loop = IO::Async::Loop->new;
+    my $future = $loop->new_future;
+    my $timer = IO::Async::Timer::Countdown->new(
+                                                 delay => $self->timeout,
+                                                 on_expire => sub {
+                                                     $future->fail("timeout connecting to $host\n", connect => $host)
+                                                 },
+                                                );
+    my $stream = IO::Async::Stream->new(
+                                        read_handle  => $socket,
+                                        on_read => sub {
+                                            my ( $stream, $buffref, $eof ) = @_;
+
+                                            $client->feed($$buffref) if ref $buffref eq 'SCALAR';
+
+                                            if ( $eof ) {
+                                                $future->fail("EOF during connect to $host\n", connect => $host);
+                                            }
+                                            elsif (my $goaway = $con->goaway) {
+                                                my $err;
+                                                if (ref $goaway eq 'HASH') {
+                                                    if ($goaway->{data} ne '') {
+                                                        $err = $goaway->{data}
+                                                    }
+                                                    elsif ($goaway->{error} > 0) {
+                                                        my $err = const_name( 'errors', $goaway->{error} );
+                                                    }
+                                                }
+                                                $err ||= 'goaway';
+                                                $err .= " during connect to $host";
+
+                                                $future->fail("$err\n", connect => $host);
+                                            }
+                                            elsif ($con->shutdown) {
+                                                $future->fail("shutdown during connect to $host\n", connect => $host);
+                                            }
+                                            elsif ($con->dec_setting(SETTINGS_MAX_CONCURRENT_STREAMS)) {
+                                                $timer->stop;
+                                                $future->done(1);
+                                            }
+
+                                            return 0;
+                                        }
+                                       );
+
+    $loop->add( $timer->start );
+    $loop->add( $stream );
+
+    # Will throw an exception if $future->fail is called above
+    my $res = $future->get;
+    $loop->remove($stream);
+    return $res;
+}
+
 sub prepare {
-    my ($self, $device_token, $payload, $cb) = @_;
+    my ($self, $device_token, $payload) = @_;
     my @headers = (
         'apns-topic' => $self->bundle_id,
     );
 
     for (qw/apns_id apns_priority apns_expiration apns_collapse_id/) {
-        my $v = $self->{$_};
+        my $v = delete $payload->{$_};
         next unless defined $v;
         my $k = $_;
         $k =~ s/_/-/g;
@@ -135,54 +244,79 @@ sub prepare {
         push @headers, authorization => sprintf('bearer %s', $jwt);
     }
     my $path = sprintf '/3/device/%s', $device_token;
-    push @{$self->{_request}}, {
-        ':scheme' => 'https',
-        ':authority' => join(":", $self->_host, $self->_port),
-        ':path' => $path,
-        ':method' => 'POST',
-        headers => \@headers,
-        data => JSON::encode_json($payload),
-        on_done => $cb,
-    };
-    return $self;
-}
-
-sub _make_client_request_single {
-    my ($self) = @_;
-    if (my $req = shift @{$self->{_request}}){
-        my $done_cb = delete $req->{on_done};
-        $self->_client->request(
-            %$req,
-            on_done => sub {
-                ref $done_cb eq 'CODE'
-                    and $done_cb->(@_);
-                $self->_make_client_request_single();
-            },
-        );
-    }
-    else {
-        $self->_client->close;
-    }
+    return {
+            ':scheme' => 'https',
+            ':authority' => join(":", $self->_host, $self->_port),
+            ':path' => $path,
+            ':method' => 'POST',
+            headers => \@headers,
+            data => JSON::encode_json($payload),
+           };
 }
 
 sub notify {
-    my ($self) = @_;
-    # request one by one as APNS server returns SETTINGS_MAX_CONCURRENT_STREAMS = 1
-    $self->_make_client_request_single();
-    my $io = IO::Select->new($self->_socket);
-    # send/recv frames until request is done
-    while ( !$self->_client->shutdown ) {
-        $io->can_write;
-        while ( my $frame = $self->_client->next_frame ) {
-            syswrite $self->_socket, $frame;
+    my ($self,$req) = @_;
+
+    my $host = $self->_host;
+    my $loop = IO::Async::Loop->new;
+    my $future = $loop->new_future;
+    my $timer = IO::Async::Timer::Countdown->new(
+                                                 delay => $self->timeout,
+                                                 on_expire => sub {
+                                                     $future->fail( "timeout reading from $host\n", read => $host )
+                                                 }
+                                                );
+    $req->{ on_done } = sub {
+        $timer->stop;
+        $future->done( @_ );
+    };
+
+    my $socket = $self->_socket;
+    my $client = $self->_client;
+    $client->request(%$req);
+
+    write_frames($socket, $client) or die "$!\n";
+
+    my $stream = IO::Async::Stream->new(
+                                        read_handle  => $socket,
+                                        on_read => sub {
+                                            my ( $self, $buffref, $eof ) = @_;
+
+                                            $client->feed($$buffref);
+
+                                            if ( $eof ) {
+                                                print "EOF\n";
+                                            }
+
+                                            return 0;
+                                        }
+                                       );
+
+    $loop->add( $timer->start );
+    $loop->add( $stream );
+
+    return $future->get;
+}
+
+sub DEMOLISH {
+    my ($self,$global) = @_;
+
+    my $socket = $self->{_socket};
+    if ( $socket && $socket->connected ) {
+        if ( my $client = $self->{_client} ) {
+            $client->close;
+
+            write_frames($socket,$self->_client) or warn $!;
+
+            while ( sysread $socket, my $data, 4096 ) {
+                $self->_client->feed($data);
+            }
+
+            undef $self->{_client};
         }
-        $io->can_read;
-        while ( sysread $self->_socket, my $data, 4096 ) {
-            $self->_client->feed($data);
-        }
+
+        $socket->close();
     }
-    undef $self->{_client};
-    $self->_socket->close(SSL_ctx_free => 1);
 }
 
 1;
@@ -225,40 +359,33 @@ And it also supports multiple stream at one connection.
         bundle_id => 'APP_ID',
     );
 
-    # 1st request
-    $apns->prepare('DEVICE_ID',{
+    # prepare request
+    my $req = $apns->prepare('DEVICE_ID',{
             aps => {
                 alert => 'APNS message: HELLO!',
                 badge => 1,
                 sound => "default",
                 # SEE: https://developer.apple.com/jp/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/Chapters/TheNotificationPayload.html,
             },
-        }, sub {
-            my ($header, $content) = @_;
-            require Data::Dumper;
-            print Dumper $header;
-
-            # $VAR1 = [
-            #           ':status',
-            #           '200',
-            #           'apns-id',
-            #           '791DE8BA-7CAA-B820-BD2D-5B12653A8DF3'
-            #         ];
-
-            print Dumper $content;
-
-            # $VAR1 = undef;
         }
     );
 
-    # 2nd request
-    $apns->prepare(...);
-
-    # also supports method chain
-    # $apns->prepare(1st request)->prepare(2nd request)....
-
     # send notification
-    $apns->notify();
+    my ($header, $content) = $apns->notify($req);
+
+    require Data::Dumper;
+    print Dumper $header;
+
+    # $VAR1 = [
+    #           ':status',
+    #           '200',
+    #           'apns-id',
+    #           '791DE8BA-7CAA-B820-BD2D-5B12653A8DF3'
+    #         ];
+
+    print Dumper $content;
+
+    # $VAR1 = undef;
 
 =head1 METHODS
 
@@ -294,6 +421,22 @@ SSL key file.
 
 If the private key is encrypted, this should be a reference to a subroutine that should return the password required to decrypt your private key.
 
+=item proxy : string
+
+URL of a proxy server. Default $ENV{https_proxy}. Pass undef to disable proxy.
+
+=back
+
+    All properties can be accessed as Getter/Setter like `$apns->development`.
+
+=head2 $apns->prepare($DEVICE_ID, $PAYLOAD);
+
+Prepare notification.
+
+Payload please refer: https://developer.apple.com/library/content/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/PayloadKeyReference.html#//apple_ref/doc/uid/TP40008194-CH17-SW1.
+
+In addition, payload can contain the following keys which specify headers and are deleted from the final payload.
+
 =item apns_id : string
 
 Canonical UUID that identifies the notification (apns-id header).
@@ -310,27 +453,9 @@ Sets the apns-priority header. Default 10.
 
 Sets the apns-collapse-id header.
 
-=item proxy : string
-
-URL of a proxy server. Default $ENV{https_proxy}. Pass undef to disable proxy.
-
-=back
-
-    All properties can be accessed as Getter/Setter like `$apns->development`.
-
-=head2 $apns->prepare($DEVICE_ID, $PAYLOAD);
-
-Prepare notification.
-It is possible to specify more than one. Please do before invoking notify method.
-
-    $apns->prepare(1st request)->prepare(2nd request)....
-
-Payload please refer: https://developer.apple.com/library/content/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/PayloadKeyReference.html#//apple_ref/doc/uid/TP40008194-CH17-SW1.
-
-=head2 $apns->notify();
+=head2 $apns->notify($req);
 
 Execute notification.
-Multiple notifications can be executed with one SSL connection.
 
 =head1 LICENSE
 
