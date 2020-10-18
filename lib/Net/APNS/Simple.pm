@@ -108,7 +108,7 @@ sub prepare {
     );
 
     for (qw/apns_id apns_priority apns_expiration apns_collapse_id/) {
-        my $v = $self->$_;
+        my $v = $self->{$_};
         next unless defined $v;
         my $k = $_;
         $k =~ s/_/-/g;
